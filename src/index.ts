@@ -271,13 +271,13 @@ app.get("/refresh", async (c) => {
   const timeEstimateMap: Record<string, string> = JSON.parse(
     c.env.TIME_ESTIMATE_MAP,
   );
-  const priorityMap: Record<string, string> = JSON.parse(c.env.PRIORITY_MAP);
   const workListId = listNameToId["Work"];
 
-  // Fetch all widget lists + board lists + work cards in parallel
+  // Fetch all widget lists (with customFieldItems for progress calc) + work cards + done cards in parallel
+  const widgetCardsByList: Record<string, TrelloCardFull[]> = {};
   const widgetFetches = listNames.map(async (listName) => {
     const listId = listNameToId[listName];
-    const url = `https://api.trello.com/1/lists/${listId}/cards?key=${trelloKey}&token=${trelloToken}&fields=name,desc,shortUrl,labels`;
+    const url = `https://api.trello.com/1/lists/${listId}/cards?key=${trelloKey}&token=${trelloToken}&fields=name,desc,shortUrl,labels&customFieldItems=true`;
 
     const resp = await fetch(url);
     if (!resp.ok) {
@@ -285,7 +285,8 @@ app.get("/refresh", async (c) => {
         `Trello API failed for ${listName}: ${resp.status} ${resp.statusText}`,
       );
     }
-    const cards: TrelloCard[] = await resp.json();
+    const cards: TrelloCardFull[] = await resp.json();
+    widgetCardsByList[listName] = cards;
 
     const buttonNames = (listNameToButtons[listName] || "").split(",");
 
@@ -305,45 +306,67 @@ app.get("/refresh", async (c) => {
     return { listName: `Card List ${listId}`, widget };
   });
 
-  const boardListsFetch = fetch(
-    `https://api.trello.com/1/boards/${toBoard}/lists?fields=id,name&card_fields=id&cards=open&key=${trelloKey}&token=${trelloToken}`,
+  // Done list isn't in LIST_NAMES, fetch separately for progress
+  const doneListId = listNameToId["Done"];
+  const doneCardsFetch = fetch(
+    `https://api.trello.com/1/lists/${doneListId}/cards?customFieldItems=true&fields=id&key=${trelloKey}&token=${trelloToken}`,
   );
 
   const workCardsFetch = fetch(
-    `https://api.trello.com/1/lists/${workListId}/cards?actions_limit=1000&actions=updateCard:idList,moveCardToBoard,moveInboxCardToBoard&customFieldItems=true&fields=id,actions,name,desc,shortUrl,labels&checklists=all&action_member=false&action_memberCreator=false&action_fields=data,date&key=${trelloKey}&token=${trelloToken}`,
+    `https://api.trello.com/1/lists/${workListId}/cards?actions_limit=1000&actions=updateCard:idList,moveCardToBoard,moveInboxCardToBoard&customFieldItems=true&fields=id,actions,name,desc,shortUrl,labels,cover&checklists=all&action_member=false&action_memberCreator=false&action_fields=data,date&key=${trelloKey}&token=${trelloToken}`,
   );
 
-  const [widgetResults, boardListsResp, workCardsResp] = await Promise.all([
+  const [widgetResults, doneCardsResp, workCardsResp] = await Promise.all([
     Promise.all(widgetFetches),
-    boardListsFetch,
+    doneCardsFetch,
     workCardsFetch,
   ]);
 
   // Build work notification
   let workNotification: any;
 
-  if (!boardListsResp.ok || !workCardsResp.ok) {
+  if (!workCardsResp.ok) {
     workNotification = {
       state: "error",
       error: "Trello API failed",
-      boardLists: boardListsResp.status,
       workCards: workCardsResp.status,
     };
   } else {
-    const boardLists: TrelloBoardList[] = await boardListsResp.json();
     const workCards: TrelloCardFull[] = await workCardsResp.json();
+    const doneCards: { customFieldItems: { idValue: string }[] }[] =
+      doneCardsResp.ok ? await doneCardsResp.json() : [];
 
-    let numMust = 0;
-    let numProgress = 0;
-    let numDone = 0;
-    for (const list of boardLists) {
-      if (list.name === "MUST") numMust = list.cards.length;
-      if (list.name === "In Progress") numProgress = list.cards.length;
-      if (list.name === "Done") numDone = list.cards.length;
-    }
+    // Reuse widget-fetched cards: Today=MUST, Progress=In Progress, Work=In Work
+    const mustCards = widgetCardsByList["Today"] ?? [];
+    const progressCards = widgetCardsByList["Progress"] ?? [];
 
-    const numTotal = numMust + numProgress + numDone;
-    const progress = numTotal > 0 ? Math.round((numDone / numTotal) * 100) : 0;
+    const numMust = mustCards.length;
+    const numProgress = progressCards.length;
+    const numWork = workCards.length;
+    const numDone = doneCards.length;
+
+    // Progress by estimated time:
+    // numerator = Done + 0.5 × Work (assume work items are halfway done)
+    // denominator = MUST + In Progress + Work + Done
+    const mustMinutes = sumEstimatedMinutes(mustCards, timeEstimateMap);
+    const progressMinutes = sumEstimatedMinutes(progressCards, timeEstimateMap);
+    const workMinutes = sumEstimatedMinutes(workCards, timeEstimateMap);
+    const doneMinutes = sumEstimatedMinutes(doneCards, timeEstimateMap);
+    const totalMinutes =
+      mustMinutes + progressMinutes + workMinutes + doneMinutes;
+    const completedMinutes = doneMinutes + workMinutes * 0.5;
+    const progress =
+      totalMinutes > 0
+        ? Math.round((completedMinutes / totalMinutes) * 100)
+        : 0;
+
+    const fmtMust = formatSeconds(mustMinutes * 60);
+    const fmtProgress = formatSeconds(progressMinutes * 60);
+    const fmtWork = formatSeconds(workMinutes * 60);
+    const fmtDone = formatSeconds(doneMinutes * 60);
+    const statusText = `${progress}%: ${fmtMust} MUST + ${fmtProgress} Progress + ${fmtWork} Work, ${fmtDone} Done`;
+
+    const numTotal = numMust + numProgress + numWork + numDone;
 
     if (numDone === numTotal && numTotal > 0) {
       workNotification = {
@@ -351,8 +374,10 @@ app.get("/refresh", async (c) => {
         progress,
         numMust,
         numProgress,
+        numWork,
         numDone,
         numTotal,
+        text: statusText,
       };
     } else if (workCards.length === 0) {
       workNotification = {
@@ -360,18 +385,18 @@ app.get("/refresh", async (c) => {
         progress,
         numMust,
         numProgress,
+        numWork,
         numDone,
         numTotal,
         icon: "W!",
         title: "None in progress",
-        text: `${progress}%: ${numMust} MUST + ${numProgress} Progress, ${numDone} Done`,
+        text: statusText,
       };
     } else {
       const card = workCards[0];
       const { priority, timeEstimate } = resolveCustomFields(
         card,
         timeEstimateMap,
-        priorityMap,
       );
       const secondsInList = computeSecondsInList(card, workListId);
       const timeInList = formatSeconds(secondsInList);
@@ -381,11 +406,12 @@ app.get("/refresh", async (c) => {
         progress,
         numMust,
         numProgress,
+        numWork,
         numDone,
-        icon: "W",
         numTotal,
+        icon: "W",
         title: `${timeInList}/${timeEstimate}: ${card.name}`,
-        text: `${progress}%: ${numMust} MUST + ${numProgress} Progress, ${numDone} Done`,
+        text: statusText,
         card: {
           id: card.id,
           name: card.name,
@@ -409,6 +435,33 @@ app.get("/refresh", async (c) => {
 
 // Custom field maps loaded from env secrets: TIME_ESTIMATE_MAP, PRIORITY_MAP
 
+// Midpoint minutes for each time estimate bucket, used for progress calculation
+const TIME_ESTIMATE_MINUTES: Record<string, number> = {
+  "<5m": 2.5,
+  "5-15m": 10,
+  "15-30m": 22.5,
+  "30m-1hr": 45,
+  "1-3hrs": 120,
+  "3+hrs": 240,
+};
+
+function sumEstimatedMinutes(
+  cards: { customFieldItems: { idValue: string }[] }[],
+  timeEstimateMap: Record<string, string>,
+): number {
+  let total = 0;
+  for (const card of cards) {
+    for (const field of card.customFieldItems) {
+      const label = timeEstimateMap[field.idValue];
+      if (label && label in TIME_ESTIMATE_MINUTES) {
+        total += TIME_ESTIMATE_MINUTES[label];
+        break;
+      }
+    }
+  }
+  return total;
+}
+
 function formatSeconds(seconds: number): string {
   if (seconds < 0) return "0s";
   if (seconds < 60) return `${Math.round(seconds)}s`;
@@ -430,13 +483,14 @@ interface TrelloCardFull extends TrelloCard {
   customFieldItems: { idValue: string; idCustomField: string }[];
   actions: TrelloAction[];
   checklists: any[];
+  cover?: { color: string | null };
 }
 
-interface TrelloBoardList {
-  id: string;
-  name: string;
-  cards: { id: string }[];
-}
+const COVER_COLOR_TO_PRIORITY: Record<string, string> = {
+  red: "MUST",
+  orange: "SHOULD",
+  yellow: "COULD",
+};
 
 function computeSecondsInList(card: TrelloCardFull, listId: string): number {
   // Initial start time: derived from card ID (Trello ObjectId = first 8 hex chars = unix timestamp)
@@ -475,22 +529,20 @@ function computeSecondsInList(card: TrelloCardFull, listId: string): number {
 function resolveCustomFields(
   card: TrelloCardFull,
   timeEstimateMap: Record<string, string>,
-  priorityMap: Record<string, string>,
 ): {
   priority: string;
   timeEstimate: string;
 } {
-  let priority = "???";
   let timeEstimate = "???";
 
   for (const field of card.customFieldItems) {
     if (field.idValue in timeEstimateMap) {
       timeEstimate = timeEstimateMap[field.idValue];
     }
-    if (field.idValue in priorityMap) {
-      priority = priorityMap[field.idValue];
-    }
   }
+
+  const priority =
+    (card.cover?.color && COVER_COLOR_TO_PRIORITY[card.cover.color]) || "WOULD";
 
   return { priority, timeEstimate };
 }
