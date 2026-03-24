@@ -301,10 +301,10 @@ app.get("/widgets", async (c) => {
   });
 
   const results = await Promise.all(fetches);
-  const output: Record<string, any> = {};
-  for (const [name, widget] of results) {
-    output[name] = widget;
-  }
+  const output = results.map(([listName, widget]) => ({
+    listName,
+    widget,
+  }));
 
   return c.json(output);
 });
