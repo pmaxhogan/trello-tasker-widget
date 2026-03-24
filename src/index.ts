@@ -256,9 +256,9 @@ function buildWidgetScaffold(
   };
 }
 
-// GET /widgets: returns all widget JSON in one shot
+// GET /refresh: returns widgets + work notification in one shot
 
-app.get("/widgets", async (c) => {
+app.get("/refresh", async (c) => {
   const trelloKey = c.env.TRELLO_KEY;
   const trelloToken = c.env.TRELLO_TOKEN;
   const toBoard = c.env.TO_BOARD;
@@ -268,9 +268,14 @@ app.get("/widgets", async (c) => {
   const listNames = c.env.LIST_NAMES;
   const listNameToButtons = c.env.LIST_NAME_TO_BUTTONS;
   const icons = c.env.ICONS;
+  const timeEstimateMap: Record<string, string> = JSON.parse(
+    c.env.TIME_ESTIMATE_MAP,
+  );
+  const priorityMap: Record<string, string> = JSON.parse(c.env.PRIORITY_MAP);
+  const workListId = listNameToId["Work"];
 
-  // Fetch all lists in parallel
-  const fetches = listNames.map(async (listName) => {
+  // Fetch all widget lists + board lists + work cards in parallel
+  const widgetFetches = listNames.map(async (listName) => {
     const listId = listNameToId[listName];
     const url = `https://api.trello.com/1/lists/${listId}/cards?key=${trelloKey}&token=${trelloToken}&fields=name,desc,shortUrl,labels`;
 
@@ -297,17 +302,196 @@ app.get("/widgets", async (c) => {
     });
 
     const widget = buildWidgetScaffold(listName, cards, items, icons);
-    return [`Card List ${listId}`, widget] as const;
+    return { listName: `Card List ${listId}`, widget };
   });
 
-  const results = await Promise.all(fetches);
-  const output = results.map(([listName, widget]) => ({
-    listName,
-    widget,
-  }));
+  const boardListsFetch = fetch(
+    `https://api.trello.com/1/boards/${toBoard}/lists?fields=id,name&card_fields=id&cards=open&key=${trelloKey}&token=${trelloToken}`,
+  );
 
-  return c.json(output);
+  const workCardsFetch = fetch(
+    `https://api.trello.com/1/lists/${workListId}/cards?actions_limit=1000&actions=updateCard:idList,moveCardToBoard,moveInboxCardToBoard&customFieldItems=true&fields=id,actions,name,desc,shortUrl,labels&checklists=all&action_member=false&action_memberCreator=false&action_fields=data,date&key=${trelloKey}&token=${trelloToken}`,
+  );
+
+  const [widgetResults, boardListsResp, workCardsResp] = await Promise.all([
+    Promise.all(widgetFetches),
+    boardListsFetch,
+    workCardsFetch,
+  ]);
+
+  // Build work notification
+  let workNotification: any;
+
+  if (!boardListsResp.ok || !workCardsResp.ok) {
+    workNotification = {
+      state: "error",
+      error: "Trello API failed",
+      boardLists: boardListsResp.status,
+      workCards: workCardsResp.status,
+    };
+  } else {
+    const boardLists: TrelloBoardList[] = await boardListsResp.json();
+    const workCards: TrelloCardFull[] = await workCardsResp.json();
+
+    let numMust = 0;
+    let numProgress = 0;
+    let numDone = 0;
+    for (const list of boardLists) {
+      if (list.name === "MUST") numMust = list.cards.length;
+      if (list.name === "In Progress") numProgress = list.cards.length;
+      if (list.name === "Done") numDone = list.cards.length;
+    }
+
+    const numTotal = numMust + numProgress + numDone;
+    const progress = numTotal > 0 ? Math.round((numDone / numTotal) * 100) : 0;
+
+    if (numDone === numTotal && numTotal > 0) {
+      workNotification = {
+        state: "all_done",
+        progress,
+        numMust,
+        numProgress,
+        numDone,
+        numTotal,
+      };
+    } else if (workCards.length === 0) {
+      workNotification = {
+        state: "none_in_work",
+        progress,
+        numMust,
+        numProgress,
+        numDone,
+        numTotal,
+        title: "None in progress",
+        text: `${progress}%: ${numMust} MUST + ${numProgress} Progress, ${numDone} Done`,
+      };
+    } else {
+      const card = workCards[0];
+      const { priority, timeEstimate } = resolveCustomFields(
+        card,
+        timeEstimateMap,
+        priorityMap,
+      );
+      const secondsInList = computeSecondsInList(card, workListId);
+      const timeInList = formatSeconds(secondsInList);
+
+      workNotification = {
+        state: "in_work",
+        progress,
+        numMust,
+        numProgress,
+        numDone,
+        numTotal,
+        title: `${timeInList}/${timeEstimate}: ${card.name}`,
+        text: `${progress}%: ${numMust} MUST + ${numProgress} Progress, ${numDone} Done`,
+        card: {
+          id: card.id,
+          name: card.name,
+          desc: card.desc,
+          shortUrl: card.shortUrl,
+          labels: card.labels,
+          priority,
+          timeEstimate,
+          timeInList,
+          secondsInList,
+        },
+      };
+    }
+  }
+
+  return c.json({
+    widgets: widgetResults,
+    workNotification,
+  });
 });
+
+// Custom field maps loaded from env secrets: TIME_ESTIMATE_MAP, PRIORITY_MAP
+
+function formatSeconds(seconds: number): string {
+  if (seconds < 0) return "0s";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${(seconds / 60).toFixed(1)}m`;
+  if (seconds < 86400) return `${(seconds / 3600).toFixed(1)}h`;
+  return `${(seconds / 86400).toFixed(1)}d`;
+}
+
+interface TrelloAction {
+  data: {
+    listBefore?: { id: string };
+    listAfter?: { id: string };
+    list?: { id: string };
+  };
+  date: string;
+}
+
+interface TrelloCardFull extends TrelloCard {
+  customFieldItems: { idValue: string; idCustomField: string }[];
+  actions: TrelloAction[];
+  checklists: any[];
+}
+
+interface TrelloBoardList {
+  id: string;
+  name: string;
+  cards: { id: string }[];
+}
+
+function computeSecondsInList(card: TrelloCardFull, listId: string): number {
+  // Initial start time: derived from card ID (Trello ObjectId = first 8 hex chars = unix timestamp)
+  let startEpoch = parseInt(card.id.substring(0, 8), 16);
+  let secondsInList = 0;
+
+  // Process actions in chronological order (Trello returns newest first)
+  const actions = [...card.actions].reverse();
+
+  for (const action of actions) {
+    const actionEpoch = Math.floor(new Date(action.date).getTime() / 1000);
+
+    const enteredList =
+      action.data.listAfter?.id === listId || action.data.list?.id === listId;
+    const exitedList = action.data.listBefore?.id === listId;
+
+    if (enteredList) {
+      startEpoch = actionEpoch;
+    }
+
+    if (exitedList) {
+      const diff = actionEpoch - startEpoch;
+      if (diff > 0) {
+        secondsInList += diff;
+      }
+    }
+  }
+
+  // Add time from last enter to now
+  const nowEpoch = Math.floor(Date.now() / 1000);
+  secondsInList += nowEpoch - startEpoch;
+
+  return secondsInList;
+}
+
+function resolveCustomFields(
+  card: TrelloCardFull,
+  timeEstimateMap: Record<string, string>,
+  priorityMap: Record<string, string>,
+): {
+  priority: string;
+  timeEstimate: string;
+} {
+  let priority = "???";
+  let timeEstimate = "???";
+
+  for (const field of card.customFieldItems) {
+    if (field.idValue in timeEstimateMap) {
+      timeEstimate = timeEstimateMap[field.idValue];
+    }
+    if (field.idValue in priorityMap) {
+      priority = priorityMap[field.idValue];
+    }
+  }
+
+  return { priority, timeEstimate };
+}
 
 export default app;
 export type { AppEnv };
