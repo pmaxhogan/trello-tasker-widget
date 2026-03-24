@@ -309,6 +309,5 @@ app.get("/widgets", async (c) => {
   return c.json(output);
 });
 
-
 export default app;
 export type { AppEnv };
