@@ -281,21 +281,21 @@ app.get("/refresh", async (c) => {
     listIdToName[id] = name;
   }
 
-  // 3 parallel API calls (down from 7):
-  // 1. All board cards — replaces 4 widget list fetches (Ready/Today/Progress/Work) + Done list fetch
+  // 3 parallel API calls:
+  // 1. All board cards — covers Ready/Today/Progress/Work/Done widget lists
   // 2. Work list cards with actions — for computeSecondsInList on active work card
-  // 3. Inbox list cards — Inbox is on a separate board, can't be fetched via board-level call
+  // 3. Inbox list cards — Inbox is on a separate board
   const auth = `key=${trelloKey}&token=${trelloToken}`;
   const inboxListId = listNameToId["Inbox"];
   const [boardCardsResp, workCardsResp, inboxCardsResp] = await Promise.all([
     fetch(
-      `https://api.trello.com/1/boards/${toBoard}/cards?customFieldItems=true&fields=name,desc,shortUrl,labels,idList,cover&${auth}`,
+      `https://api.trello.com/1/boards/${toBoard}/cards?customFieldItems=true&fields=name,desc,shortUrl,labels,idList,cover&label_fields=name&${auth}`,
     ),
     fetch(
-      `https://api.trello.com/1/lists/${workListId}/cards?actions=updateCard:idList,moveCardToBoard,moveInboxCardToBoard&actions_limit=1000&customFieldItems=true&fields=id,actions,name,desc,shortUrl,labels,cover&checklists=all&action_member=false&action_memberCreator=false&action_fields=data,date&${auth}`,
+      `https://api.trello.com/1/lists/${workListId}/cards?actions=updateCard:idList,moveCardToBoard,moveInboxCardToBoard&actions_limit=1000&customFieldItems=true&fields=id,name,desc,shortUrl,labels,cover&action_member=false&action_memberCreator=false&action_fields=data,date&label_fields=name&${auth}`,
     ),
     fetch(
-      `https://api.trello.com/1/lists/${inboxListId}/cards?customFieldItems=true&fields=name,desc,shortUrl,labels&${auth}`,
+      `https://api.trello.com/1/lists/${inboxListId}/cards?customFieldItems=true&fields=name,desc,shortUrl,labels&label_fields=name&${auth}`,
     ),
   ]);
 
