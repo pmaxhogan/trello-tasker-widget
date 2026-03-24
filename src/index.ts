@@ -297,7 +297,7 @@ app.get("/widgets", async (c) => {
     });
 
     const widget = buildWidgetScaffold(listName, cards, items, icons);
-    return [listName, widget] as const;
+    return [`Card List ${listId}`, widget] as const;
   });
 
   const results = await Promise.all(fetches);
