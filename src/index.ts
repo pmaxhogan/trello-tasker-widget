@@ -257,6 +257,7 @@ function buildWidgetScaffold(
 }
 
 // GET /refresh: returns widgets + work notification in one shot
+// Optimized: uses Trello batch API to combine all fetches into a single HTTP request
 
 app.get("/refresh", async (c) => {
   const trelloKey = c.env.TRELLO_KEY;
@@ -272,22 +273,62 @@ app.get("/refresh", async (c) => {
     c.env.TIME_ESTIMATE_MAP,
   );
   const workListId = listNameToId["Work"];
+  const doneListId = listNameToId["Done"];
 
-  // Fetch all widget lists (with customFieldItems for progress calc) + work cards + done cards in parallel
-  const widgetCardsByList: Record<string, TrelloCardFull[]> = {};
-  const widgetFetches = listNames.map(async (listName) => {
+  // Build reverse lookup: listId → listName
+  const listIdToName: Record<string, string> = {};
+  for (const [name, id] of Object.entries(listNameToId)) {
+    listIdToName[id] = name;
+  }
+
+  // 3 parallel API calls (down from 7):
+  // 1. All board cards — replaces 4 widget list fetches (Ready/Today/Progress/Work) + Done list fetch
+  // 2. Work list cards with actions — for computeSecondsInList on active work card
+  // 3. Inbox list cards — Inbox is on a separate board, can't be fetched via board-level call
+  const auth = `key=${trelloKey}&token=${trelloToken}`;
+  const inboxListId = listNameToId["Inbox"];
+  const [boardCardsResp, workCardsResp, inboxCardsResp] = await Promise.all([
+    fetch(
+      `https://api.trello.com/1/boards/${toBoard}/cards?customFieldItems=true&fields=name,desc,shortUrl,labels,idList,cover&${auth}`,
+    ),
+    fetch(
+      `https://api.trello.com/1/lists/${workListId}/cards?actions=updateCard:idList,moveCardToBoard,moveInboxCardToBoard&actions_limit=1000&customFieldItems=true&fields=id,actions,name,desc,shortUrl,labels,cover&checklists=all&action_member=false&action_memberCreator=false&action_fields=data,date&${auth}`,
+    ),
+    fetch(
+      `https://api.trello.com/1/lists/${inboxListId}/cards?customFieldItems=true&fields=name,desc,shortUrl,labels&${auth}`,
+    ),
+  ]);
+
+  if (!boardCardsResp.ok) {
+    return c.json(
+      { error: "Trello board cards API failed", status: boardCardsResp.status },
+      500,
+    );
+  }
+
+  const allCards: (TrelloCardFull & { idList: string })[] =
+    await boardCardsResp.json();
+  const workCardsWithActions: TrelloCardFull[] = workCardsResp.ok
+    ? await workCardsResp.json()
+    : [];
+  const inboxCards: TrelloCardFull[] = inboxCardsResp.ok
+    ? await inboxCardsResp.json()
+    : [];
+
+  // Partition all board cards by list
+  const cardsByListId: Record<string, TrelloCardFull[]> = {};
+  for (const card of allCards) {
+    const lid = card.idList;
+    if (!cardsByListId[lid]) cardsByListId[lid] = [];
+    cardsByListId[lid].push(card);
+  }
+  // Inbox is on a separate board — inject into the partition map
+  cardsByListId[inboxListId] = inboxCards;
+
+  // Build widgets for each list in LIST_NAMES
+  const widgetResults = listNames.map((listName) => {
     const listId = listNameToId[listName];
-    const url = `https://api.trello.com/1/lists/${listId}/cards?key=${trelloKey}&token=${trelloToken}&fields=name,desc,shortUrl,labels&customFieldItems=true`;
-
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      throw new Error(
-        `Trello API failed for ${listName}: ${resp.status} ${resp.statusText}`,
-      );
-    }
-    const cards: TrelloCardFull[] = await resp.json();
-    widgetCardsByList[listName] = cards;
-
+    const cards: TrelloCardFull[] = cardsByListId[listId] ?? [];
     const buttonNames = (listNameToButtons[listName] || "").split(",");
 
     const items = cards.map((card) => {
@@ -306,125 +347,93 @@ app.get("/refresh", async (c) => {
     return { listName: `Card List ${listId}`, widget };
   });
 
-  // Done list isn't in LIST_NAMES, fetch separately for progress
-  const doneListId = listNameToId["Done"];
-  const doneCardsFetch = fetch(
-    `https://api.trello.com/1/lists/${doneListId}/cards?customFieldItems=true&fields=id&key=${trelloKey}&token=${trelloToken}`,
-  );
+  // Build work notification using partitioned cards
+  const mustCards = cardsByListId[listNameToId["Today"]] ?? [];
+  const progressCards = cardsByListId[listNameToId["Progress"]] ?? [];
+  const workCards = workCardsWithActions;
+  const doneCards = cardsByListId[doneListId] ?? [];
 
-  const workCardsFetch = fetch(
-    `https://api.trello.com/1/lists/${workListId}/cards?actions_limit=1000&actions=updateCard:idList,moveCardToBoard,moveInboxCardToBoard&customFieldItems=true&fields=id,actions,name,desc,shortUrl,labels,cover&checklists=all&action_member=false&action_memberCreator=false&action_fields=data,date&key=${trelloKey}&token=${trelloToken}`,
-  );
+  const numMust = mustCards.length;
+  const numProgress = progressCards.length;
+  const numWork = workCards.length;
+  const numDone = doneCards.length;
 
-  const [widgetResults, doneCardsResp, workCardsResp] = await Promise.all([
-    Promise.all(widgetFetches),
-    doneCardsFetch,
-    workCardsFetch,
-  ]);
+  const mustMinutes = sumEstimatedMinutes(mustCards, timeEstimateMap);
+  const progressMinutes = sumEstimatedMinutes(progressCards, timeEstimateMap);
+  const workMinutes = sumEstimatedMinutes(workCards, timeEstimateMap);
+  const doneMinutes = sumEstimatedMinutes(doneCards, timeEstimateMap);
+  const totalMinutes =
+    mustMinutes + progressMinutes + workMinutes + doneMinutes;
+  const completedMinutes = doneMinutes + workMinutes * 0.5;
+  const progress =
+    totalMinutes > 0 ? Math.round((completedMinutes / totalMinutes) * 100) : 0;
 
-  // Build work notification
+  const fmtMust = formatSeconds(mustMinutes * 60);
+  const fmtProgress = formatSeconds(progressMinutes * 60);
+  const fmtWork = formatSeconds(workMinutes * 60);
+  const fmtDone = formatSeconds(doneMinutes * 60);
+  const statusText = `${progress}%: ${fmtMust} MUST + ${fmtProgress} Progress + ${fmtWork} Work, ${fmtDone} Done`;
+
+  const numTotal = numMust + numProgress + numWork + numDone;
+
   let workNotification: any;
 
-  if (!workCardsResp.ok) {
+  if (numDone === numTotal && numTotal > 0) {
     workNotification = {
-      state: "error",
-      error: "Trello API failed",
-      workCards: workCardsResp.status,
+      state: "all_done",
+      progress,
+      numMust,
+      numProgress,
+      numWork,
+      numDone,
+      numTotal,
+      text: statusText,
+    };
+  } else if (workCards.length === 0) {
+    workNotification = {
+      state: "none_in_work",
+      progress,
+      numMust,
+      numProgress,
+      numWork,
+      numDone,
+      numTotal,
+      icon: "W!",
+      title: "None in progress",
+      text: statusText,
     };
   } else {
-    const workCards: TrelloCardFull[] = await workCardsResp.json();
-    const doneCards: { customFieldItems: { idValue: string }[] }[] =
-      doneCardsResp.ok ? await doneCardsResp.json() : [];
+    const card = workCards[0];
+    const { priority, timeEstimate } = resolveCustomFields(
+      card,
+      timeEstimateMap,
+    );
+    const secondsInList = computeSecondsInList(card, workListId);
+    const timeInList = formatSeconds(secondsInList);
 
-    // Reuse widget-fetched cards: Today=MUST, Progress=In Progress, Work=In Work
-    const mustCards = widgetCardsByList["Today"] ?? [];
-    const progressCards = widgetCardsByList["Progress"] ?? [];
-
-    const numMust = mustCards.length;
-    const numProgress = progressCards.length;
-    const numWork = workCards.length;
-    const numDone = doneCards.length;
-
-    // Progress by estimated time:
-    // numerator = Done + 0.5 × Work (assume work items are halfway done)
-    // denominator = MUST + In Progress + Work + Done
-    const mustMinutes = sumEstimatedMinutes(mustCards, timeEstimateMap);
-    const progressMinutes = sumEstimatedMinutes(progressCards, timeEstimateMap);
-    const workMinutes = sumEstimatedMinutes(workCards, timeEstimateMap);
-    const doneMinutes = sumEstimatedMinutes(doneCards, timeEstimateMap);
-    const totalMinutes =
-      mustMinutes + progressMinutes + workMinutes + doneMinutes;
-    const completedMinutes = doneMinutes + workMinutes * 0.5;
-    const progress =
-      totalMinutes > 0
-        ? Math.round((completedMinutes / totalMinutes) * 100)
-        : 0;
-
-    const fmtMust = formatSeconds(mustMinutes * 60);
-    const fmtProgress = formatSeconds(progressMinutes * 60);
-    const fmtWork = formatSeconds(workMinutes * 60);
-    const fmtDone = formatSeconds(doneMinutes * 60);
-    const statusText = `${progress}%: ${fmtMust} MUST + ${fmtProgress} Progress + ${fmtWork} Work, ${fmtDone} Done`;
-
-    const numTotal = numMust + numProgress + numWork + numDone;
-
-    if (numDone === numTotal && numTotal > 0) {
-      workNotification = {
-        state: "all_done",
-        progress,
-        numMust,
-        numProgress,
-        numWork,
-        numDone,
-        numTotal,
-        text: statusText,
-      };
-    } else if (workCards.length === 0) {
-      workNotification = {
-        state: "none_in_work",
-        progress,
-        numMust,
-        numProgress,
-        numWork,
-        numDone,
-        numTotal,
-        icon: "W!",
-        title: "None in progress",
-        text: statusText,
-      };
-    } else {
-      const card = workCards[0];
-      const { priority, timeEstimate } = resolveCustomFields(
-        card,
-        timeEstimateMap,
-      );
-      const secondsInList = computeSecondsInList(card, workListId);
-      const timeInList = formatSeconds(secondsInList);
-
-      workNotification = {
-        state: "in_work",
-        progress,
-        numMust,
-        numProgress,
-        numWork,
-        numDone,
-        numTotal,
-        icon: "W",
-        title: `${timeInList}/${timeEstimate}: ${card.name}`,
-        text: statusText,
-        card: {
-          id: card.id,
-          name: card.name,
-          desc: card.desc,
-          shortUrl: card.shortUrl,
-          labels: card.labels,
-          priority,
-          timeEstimate,
-          timeInList,
-          secondsInList,
-        },
-      };
-    }
+    workNotification = {
+      state: "in_work",
+      progress,
+      numMust,
+      numProgress,
+      numWork,
+      numDone,
+      numTotal,
+      icon: "W",
+      title: `${timeInList}/${timeEstimate}: ${card.name}`,
+      text: statusText,
+      card: {
+        id: card.id,
+        name: card.name,
+        desc: card.desc,
+        shortUrl: card.shortUrl,
+        labels: card.labels,
+        priority,
+        timeEstimate,
+        timeInList,
+        secondsInList,
+      },
+    };
   }
 
   return c.json({
