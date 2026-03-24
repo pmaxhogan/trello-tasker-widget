@@ -362,6 +362,7 @@ app.get("/refresh", async (c) => {
         numProgress,
         numDone,
         numTotal,
+        icon: "W!",
         title: "None in progress",
         text: `${progress}%: ${numMust} MUST + ${numProgress} Progress, ${numDone} Done`,
       };
@@ -381,6 +382,7 @@ app.get("/refresh", async (c) => {
         numMust,
         numProgress,
         numDone,
+        icon: "W",
         numTotal,
         title: `${timeInList}/${timeEstimate}: ${card.name}`,
         text: `${progress}%: ${numMust} MUST + ${numProgress} Progress, ${numDone} Done`,
