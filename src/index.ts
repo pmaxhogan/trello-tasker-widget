@@ -6,6 +6,8 @@ type AppEnv = {
 
 const app = new OpenAPIHono<AppEnv>();
 
+app.get("/health", (c) => c.text("OK"));
+
 // Auth middleware
 app.use("*", async (c, next) => {
   const secret = c.env.API_KEY;
@@ -13,7 +15,7 @@ app.use("*", async (c, next) => {
 
   const authToken = c.req.header("Authorization") || "";
   const bearer = authToken.split(" ")[1] ?? "";
-  const token = bearer || c.req.query("apiToken") || "";
+  const token = bearer || c.req.query("apiKey") || "";
 
   const encoder = new TextEncoder();
   const userValue = encoder.encode(token);
@@ -28,7 +30,7 @@ app.use("*", async (c, next) => {
   await next();
 });
 
-// # Trello types #
+// Trello types
 
 interface TrelloCard {
   id: string;
@@ -38,8 +40,7 @@ interface TrelloCard {
   labels: { name: string }[];
 }
 
-// # Button builders (mirrors "Get Buttons Json" task) #
-
+// Button builders
 function buildButtons(
   buttonNames: string[],
   card: TrelloCard,
@@ -131,7 +132,7 @@ function buildButtons(
   return out;
 }
 
-// # Card → widget row (mirrors "Card List Widget" loop body) #
+// Card → widget row
 
 function cardToWidgetRow(card: TrelloCard, buttons: any[]): any {
   const cardname = card.name; // already plain text from Trello API
@@ -192,8 +193,7 @@ function cardToWidgetRow(card: TrelloCard, buttons: any[]): any {
   };
 }
 
-// # Build full widget scaffold for one list #
-
+// Build full widget scaffold for one list
 function buildWidgetScaffold(
   listName: string,
   cards: TrelloCard[],
@@ -256,7 +256,7 @@ function buildWidgetScaffold(
   };
 }
 
-// # GET /widgets: returns all widget JSON in one shot #
+// GET /widgets: returns all widget JSON in one shot
 
 app.get("/widgets", async (c) => {
   const trelloKey = c.env.TRELLO_KEY;
@@ -308,6 +308,7 @@ app.get("/widgets", async (c) => {
 
   return c.json(output);
 });
+
 
 export default app;
 export type { AppEnv };
