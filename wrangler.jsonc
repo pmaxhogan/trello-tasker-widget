@@ -28,6 +28,12 @@
    * Note: Use secrets to store sensitive data.
    * https://developers.cloudflare.com/workers/configuration/secrets/
    */
+  "kv_namespaces": [
+    {
+      "binding": "SESSION_KV",
+      "id": "4403ec57622d469d90c4748adf5ed781",
+    },
+  ],
   "vars": {
     "LIST_NAMES": ["Inbox", "Ready", "Today", "Progress", "Work"],
     "LIST_NAME_TO_BUTTONS": {

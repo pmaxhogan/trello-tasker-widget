@@ -8,26 +8,153 @@ const app = new OpenAPIHono<AppEnv>();
 
 app.get("/health", (c) => c.text("OK"));
 
-// Auth middleware
+// Public privacy policy for the companion Chrome extension listing.
+// Chrome Web Store rejects "owner sites" as privacy-policy URLs, so we serve
+// a dedicated page with nothing else on it from the same origin the
+// extension talks to.
+const PRIVACY_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Privacy Policy — Trello Inbox Sync</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+    line-height: 1.55;
+    max-width: 720px;
+    margin: 40px auto;
+    padding: 0 20px;
+  }
+  h1 { margin-bottom: 4px; }
+  .updated { color: #666; font-size: 14px; margin-bottom: 28px; }
+  h2 { margin-top: 32px; font-size: 18px; }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+</style>
+</head>
+<body>
+<h1>Trello Inbox Sync — Privacy Policy</h1>
+<p class="updated">Last updated: 2026-07-05</p>
+
+<h2>Who this applies to</h2>
+<p>This policy applies to the Chrome extension <strong>Trello Inbox Sync</strong> (item ID <code>doiidcdjajjegchmhaahihopenpohmdp</code>), published by pmaxhogan for personal use with the <code>trello-tasker-widget</code> Cloudflare Worker.</p>
+
+<h2>What data the extension collects</h2>
+<p>The extension reads exactly <strong>one value</strong>: the <code>cloud.session.token</code> cookie set by <code>trello.com</code> in the user's own browser. No other cookies, page contents, form inputs, URLs, tab history, telemetry, analytics, crash reports, device identifiers, or usage metrics are read, recorded, or transmitted.</p>
+
+<h2>Why it is collected</h2>
+<p>Trello's built-in personal Inbox is not accessible through Trello's public REST API under any key + token combination — only browser sessions authenticated with the <code>cloud.session.token</code> cookie can read it. The extension exists solely to make the user's own Cloudflare Worker (the trello-tasker-widget backend) able to fetch the Inbox on the user's behalf, so it can be rendered on the user's Android Tasker widget.</p>
+
+<h2>Where it is sent</h2>
+<p>The cookie value is transmitted over HTTPS to a single endpoint: the user-specific Cloudflare Worker at <code>https://trello-tasker-widget.pmaxhogan.workers.dev/trello-session</code>. It is never sent anywhere else, and never sold, shared, or transferred to any third party, analytics service, advertising network, or affiliate.</p>
+
+<h2>Where it is stored</h2>
+<p>On the user's device: the extension's own configuration secret (the <code>INBOX_SESSION_KEY</code> the user pastes into the popup) and a last-sync timestamp/status are held in <code>chrome.storage.sync</code> and <code>chrome.storage.local</code>. On the backend: the Trello session cookie value is stored in a single Cloudflare Workers KV entry (<code>SESSION_KV["trello:cookie"]</code>) accessible only to the user's own Cloudflare account. Each new sync overwrites the previous value.</p>
+
+<h2>Retention and deletion</h2>
+<p>Uninstalling the extension immediately removes all extension-side storage from the browser. To delete the server-side copy, the user runs <code>wrangler kv key delete "trello:cookie" --namespace-id=&lt;their-namespace&gt;</code> against their own Cloudflare account, or deletes the KV namespace entirely.</p>
+
+<h2>Third parties</h2>
+<p>None. The extension does not integrate with, load code from, or send any data to any third-party service. Its only network activity is a single POST to the user's own Worker.</p>
+
+<h2>Children</h2>
+<p>The extension is not directed at children under 13 and does not knowingly collect data from them.</p>
+
+<h2>Changes to this policy</h2>
+<p>If the extension's data handling changes, this page will be updated and the "Last updated" date above will change. Users can review the current version at any time at this URL.</p>
+
+<h2>Contact</h2>
+<p>Questions or requests: <a href="mailto:max@maxhogan.dev">max@maxhogan.dev</a>.</p>
+</body>
+</html>`;
+
+app.get("/privacy", (c) => c.html(PRIVACY_HTML));
+
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const encoder = new TextEncoder();
+  const av = encoder.encode(a);
+  const bv = encoder.encode(b);
+  if (av.byteLength !== bv.byteLength) {
+    // still spend time on a comparison to keep timing uniform
+    crypto.subtle.timingSafeEqual(av, av);
+    return false;
+  }
+  return crypto.subtle.timingSafeEqual(av, bv);
+}
+
+// Auth middleware — gates /refresh with the widget-facing API_KEY.
+// /trello-session bypasses this and is instead gated by INBOX_SESSION_KEY
+// (distinct secret) so a leak of the widget key does not compromise the
+// Chrome-extension endpoint and vice versa.
 app.use("*", async (c, next) => {
+  if (c.req.path === "/trello-session" || c.req.path === "/privacy") {
+    await next();
+    return;
+  }
   const secret = c.env.API_KEY;
   if (!secret) return c.text("Missing secret binding", 500);
-
   const authToken = c.req.header("Authorization") || "";
   const bearer = authToken.split(" ")[1] ?? "";
   const token = bearer || c.req.query("apiKey") || "";
-
-  const encoder = new TextEncoder();
-  const userValue = encoder.encode(token);
-  const secretValue = encoder.encode(secret);
-
-  const lengthsMatch = userValue.byteLength === secretValue.byteLength;
-  const isEqual = lengthsMatch
-    ? crypto.subtle.timingSafeEqual(userValue, secretValue)
-    : !crypto.subtle.timingSafeEqual(userValue, userValue);
-
-  if (!isEqual) return c.text("Unauthorized", 401);
+  if (!timingSafeEqualStr(token, secret)) return c.text("Unauthorized", 401);
   await next();
+});
+
+// POST /trello-session — companion Chrome extension pushes the current
+// cloud.session.token cookie value here. Used to fetch the Inbox list, which
+// Trello's public REST API 401s under any key+token.
+//
+// Security posture (this repo is public — do not weaken these):
+// - Gated by INBOX_SESSION_KEY, distinct from the widget API_KEY. A leak of
+//   one does not compromise the other. Extension stores the key in
+//   chrome.storage.sync (per-user, encrypted); nothing hardcoded in source.
+// - Constant-time comparison to prevent timing oracle on the key.
+// - KV-backed rate limit (~20 writes/min globally) blunts a junk-token DoS
+//   even if the key leaks — worst case the widget shows a stale/broken
+//   Inbox row until the next legitimate sync overwrites the KV entry.
+// - Shape validation on the cookie payload: Trello's cloud.session.token is
+//   a URL-safe base64ish string, 40–4096 chars. Reject anything else.
+const SESSION_COOKIE_SHAPE = /^[A-Za-z0-9._\-+/=%~]{40,4096}$/;
+
+async function checkAndBumpSessionRate(kv: KVNamespace): Promise<boolean> {
+  const windowSec = 60;
+  const limit = 20;
+  const bucket = Math.floor(Date.now() / 1000 / windowSec);
+  const key = `sessionrate:${bucket}`;
+  const current = parseInt((await kv.get(key)) ?? "0", 10);
+  if (current >= limit) return false;
+  await kv.put(key, String(current + 1), {
+    expirationTtl: windowSec * 2,
+  });
+  return true;
+}
+
+app.post("/trello-session", async (c) => {
+  const expected = c.env.INBOX_SESSION_KEY;
+  if (!expected) return c.text("Missing secret binding", 500);
+  const authToken = c.req.header("Authorization") || "";
+  const bearer = authToken.split(" ")[1] ?? "";
+  if (!timingSafeEqualStr(bearer, expected)) {
+    return c.text("Unauthorized", 401);
+  }
+  if (!(await checkAndBumpSessionRate(c.env.SESSION_KV))) {
+    return c.text("Rate limited", 429);
+  }
+  let body: { token?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+  const token = body.token;
+  if (typeof token !== "string" || !SESSION_COOKIE_SHAPE.test(token)) {
+    return c.json({ error: "missing or malformed token" }, 400);
+  }
+  await c.env.SESSION_KV.put("trello:cookie", token);
+  return c.json({ ok: true, length: token.length });
 });
 
 // Trello types
@@ -284,9 +411,17 @@ app.get("/refresh", async (c) => {
   // 3 parallel API calls:
   // 1. All board cards — covers Ready/Today/Progress/Work/Done widget lists
   // 2. Work list cards with actions — for computeSecondsInList on active work card
-  // 3. Inbox list cards — Inbox is on a separate board
+  // 3. Inbox list cards — Inbox is on a separate board, cookie-authenticated
+  //
+  // NOTE: Trello's built-in personal Inbox (from /members/me?fields=inbox) is
+  // NOT accessible via key+token — every REST endpoint 401s regardless of scope.
+  // It only responds to cookie-authenticated browser sessions. A companion
+  // Chrome extension keeps SESSION_KV["trello:cookie"] fresh with the current
+  // cloud.session.token cookie; we fetch the Inbox list via trello.com with
+  // that cookie as `Cookie: cloud.session.token=<val>`.
   const auth = `key=${trelloKey}&token=${trelloToken}`;
   const inboxListId = listNameToId["Inbox"];
+  const trelloSessionCookie = await c.env.SESSION_KV.get("trello:cookie");
   const [boardCardsResp, workCardsResp, inboxCardsResp] = await Promise.all([
     fetch(
       `https://api.trello.com/1/boards/${toBoard}/cards?customFieldItems=true&fields=name,desc,shortUrl,labels,idList,cover&label_fields=name&${auth}`,
@@ -294,9 +429,14 @@ app.get("/refresh", async (c) => {
     fetch(
       `https://api.trello.com/1/lists/${workListId}/cards?actions=updateCard:idList,moveCardToBoard,moveInboxCardToBoard&actions_limit=1000&customFieldItems=true&fields=id,name,desc,shortUrl,labels,cover&action_member=false&action_memberCreator=false&action_fields=data,date&label_fields=name&${auth}`,
     ),
-    fetch(
-      `https://api.trello.com/1/lists/${inboxListId}/cards?customFieldItems=true&fields=name,desc,shortUrl,labels&label_fields=name&${auth}`,
-    ),
+    trelloSessionCookie
+      ? fetch(
+          `https://trello.com/1/lists/${inboxListId}/cards?customFieldItems=true&fields=name,desc,shortUrl,labels&label_fields=name`,
+          { headers: { Cookie: `cloud.session.token=${trelloSessionCookie}` } },
+        )
+      : Promise.resolve(
+          new Response("no session cookie stored", { status: 428 }),
+        ),
   ]);
 
   if (!boardCardsResp.ok) {
@@ -311,9 +451,14 @@ app.get("/refresh", async (c) => {
   const workCardsWithActions: TrelloCardFull[] = workCardsResp.ok
     ? await workCardsResp.json()
     : [];
-  const inboxCards: TrelloCardFull[] = inboxCardsResp.ok
-    ? await inboxCardsResp.json()
-    : [];
+  let inboxCards: TrelloCardFull[] = [];
+  let inboxError: string | null = null;
+  if (inboxCardsResp.ok) {
+    inboxCards = await inboxCardsResp.json();
+  } else {
+    const body = await inboxCardsResp.text().catch(() => "");
+    inboxError = `${inboxCardsResp.status}: ${body.slice(0, 200)}`;
+  }
 
   // Partition all board cards by list
   const cardsByListId: Record<string, TrelloCardFull[]> = {};
@@ -342,6 +487,30 @@ app.get("/refresh", async (c) => {
       );
       return cardToWidgetRow(card, buttons);
     });
+
+    if (listName === "Inbox" && inboxError) {
+      const isNoCookie = inboxError.startsWith("428");
+      const rowText = isNoCookie
+        ? "Install Trello Inbox Sync extension → sign in to trello.com"
+        : `Open Trello Inbox (session issue: ${inboxError})`;
+      items.push({
+        children: [
+          {
+            align: "Start",
+            maxLines: 3,
+            text: rowText,
+            isWeighted: false,
+            type: "Text",
+            task: "Open Par2",
+            taskVariables: { par2: "https://trello.com/inbox" },
+          },
+        ],
+        horizontalAlignment: "Start",
+        verticalAlignment: "Center",
+        size: { fillMaxWidth: true },
+        type: "Row",
+      });
+    }
 
     const widget = buildWidgetScaffold(listName, cards, items, icons);
     return { listName: `Card List ${listId}`, widget };
@@ -439,6 +608,7 @@ app.get("/refresh", async (c) => {
   return c.json({
     widgets: widgetResults,
     workNotification,
+    ...(inboxError ? { inboxError } : {}),
   });
 });
 
