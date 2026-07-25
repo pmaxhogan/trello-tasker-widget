@@ -37,25 +37,25 @@ const PRIVACY_HTML = `<!doctype html>
 </head>
 <body>
 <h1>Trello Inbox Sync — Privacy Policy</h1>
-<p class="updated">Last updated: 2026-07-05</p>
+<p class="updated">Last updated: 2026-07-25</p>
 
 <h2>Who this applies to</h2>
 <p>This policy applies to the Chrome extension <strong>Trello Inbox Sync</strong> (item ID <code>doiidcdjajjegchmhaahihopenpohmdp</code>), published by pmaxhogan for personal use with the <code>trello-tasker-widget</code> Cloudflare Worker.</p>
 
 <h2>What data the extension collects</h2>
-<p>The extension reads exactly <strong>one value</strong>: the <code>cloud.session.token</code> cookie set by <code>trello.com</code> in the user's own browser. No other cookies, page contents, form inputs, URLs, tab history, telemetry, analytics, crash reports, device identifiers, or usage metrics are read, recorded, or transmitted.</p>
+<p>The extension reads exactly <strong>two values</strong>: the <code>cloud.session.token</code> cookie and the <code>dsc</code> cookie (Trello's CSRF token), both set by <code>trello.com</code> in the user's own browser. No other cookies, page contents, form inputs, URLs, tab history, telemetry, analytics, crash reports, device identifiers, or usage metrics are read, recorded, or transmitted.</p>
 
 <h2>Why it is collected</h2>
-<p>Trello's built-in personal Inbox is not accessible through Trello's public REST API under any key + token combination — only browser sessions authenticated with the <code>cloud.session.token</code> cookie can read it. The extension exists solely to make the user's own Cloudflare Worker (the trello-tasker-widget backend) able to fetch the Inbox on the user's behalf, so it can be rendered on the user's Android Tasker widget.</p>
+<p>Trello's built-in personal Inbox is not accessible through Trello's public REST API under any key + token combination — only browser sessions authenticated with the <code>cloud.session.token</code> cookie can read it, and modifying its cards additionally requires the session's <code>dsc</code> CSRF token. The extension exists solely to make the user's own Cloudflare Worker (the trello-tasker-widget backend) able to fetch the Inbox and act on its cards on the user's behalf, so it can be used from the user's Android Tasker widget.</p>
 
 <h2>Where it is sent</h2>
 <p>The cookie value is transmitted over HTTPS to a single endpoint: the user-specific Cloudflare Worker at <code>https://trello-tasker-widget.pmaxhogan.workers.dev/trello-session</code>. It is never sent anywhere else, and never sold, shared, or transferred to any third party, analytics service, advertising network, or affiliate.</p>
 
 <h2>Where it is stored</h2>
-<p>On the user's device: the extension's own configuration secret (the <code>INBOX_SESSION_KEY</code> the user pastes into the popup) and a last-sync timestamp/status are held in <code>chrome.storage.sync</code> and <code>chrome.storage.local</code>. On the backend: the Trello session cookie value is stored in a single Cloudflare Workers KV entry (<code>SESSION_KV["trello:cookie"]</code>) accessible only to the user's own Cloudflare account. Each new sync overwrites the previous value.</p>
+<p>On the user's device: the extension's own configuration secret (the <code>INBOX_SESSION_KEY</code> the user pastes into the popup) and a last-sync timestamp/status are held in <code>chrome.storage.sync</code> and <code>chrome.storage.local</code>. On the backend: the two cookie values are stored in two Cloudflare Workers KV entries (<code>SESSION_KV["trello:cookie"]</code> and <code>SESSION_KV["trello:dsc"]</code>) accessible only to the user's own Cloudflare account. Each new sync overwrites the previous values.</p>
 
 <h2>Retention and deletion</h2>
-<p>Uninstalling the extension immediately removes all extension-side storage from the browser. To delete the server-side copy, the user runs <code>wrangler kv key delete "trello:cookie" --namespace-id=&lt;their-namespace&gt;</code> against their own Cloudflare account, or deletes the KV namespace entirely.</p>
+<p>Uninstalling the extension immediately removes all extension-side storage from the browser. To delete the server-side copies, the user runs <code>wrangler kv key delete "trello:cookie" --namespace-id=&lt;their-namespace&gt;</code> (and the same for <code>"trello:dsc"</code>) against their own Cloudflare account, or deletes the KV namespace entirely.</p>
 
 <h2>Third parties</h2>
 <p>None. The extension does not integrate with, load code from, or send any data to any third-party service. Its only network activity is a single POST to the user's own Worker.</p>
@@ -117,7 +117,13 @@ app.use("*", async (c, next) => {
 //   Inbox row until the next legitimate sync overwrites the KV entry.
 // - Shape validation on the cookie payload: Trello's cloud.session.token is
 //   a URL-safe base64ish string, 40–4096 chars. Reject anything else.
+//
+// The payload also carries the `dsc` cookie: Trello's CSRF token. Reads
+// (like the Inbox fetch in /refresh) work with cloud.session.token alone,
+// but cookie-authenticated writes (archive/move on Inbox cards) are rejected
+// unless the request carries a dsc value matching the session's dsc cookie.
 const SESSION_COOKIE_SHAPE = /^[A-Za-z0-9._\-+/=%~]{40,4096}$/;
+const DSC_COOKIE_SHAPE = /^[A-Za-z0-9._\-+/=%~]{16,4096}$/;
 
 async function checkAndBumpSessionRate(kv: KVNamespace): Promise<boolean> {
   const windowSec = 60;
@@ -143,7 +149,7 @@ app.post("/trello-session", async (c) => {
   if (!(await checkAndBumpSessionRate(c.env.SESSION_KV))) {
     return c.text("Rate limited", 429);
   }
-  let body: { token?: unknown };
+  let body: { token?: unknown; dsc?: unknown };
   try {
     body = await c.req.json();
   } catch {
@@ -153,8 +159,126 @@ app.post("/trello-session", async (c) => {
   if (typeof token !== "string" || !SESSION_COOKIE_SHAPE.test(token)) {
     return c.json({ error: "missing or malformed token" }, 400);
   }
+  const dsc = body.dsc;
+  const hasDsc = typeof dsc === "string" && DSC_COOKIE_SHAPE.test(dsc);
   await c.env.SESSION_KV.put("trello:cookie", token);
-  return c.json({ ok: true, length: token.length });
+  // Keep the stored dsc paired with the session it came from: store it when
+  // the extension sends one, drop any stale value when it doesn't (a dsc from
+  // an older session would fail Trello's CSRF check anyway).
+  if (hasDsc) {
+    await c.env.SESSION_KV.put("trello:dsc", dsc);
+  } else {
+    await c.env.SESSION_KV.delete("trello:dsc");
+  }
+  return c.json({ ok: true, length: token.length, dsc: hasDsc });
+});
+
+// PUT/POST /1/cards/:id — card-update proxy for the Tasker tasks (archive,
+// move, done). Mirrors Trello's own path/params so switching a task is just a
+// URL swap: api.trello.com → this worker (+ apiKey=, − key=/token=).
+//
+// Why it exists: like reads, writes against Inbox cards 403 under any
+// key+token — only cookie-authenticated sessions may touch them. Strategy:
+// try the official REST API first (normal board cards), and on 401/403 fall
+// back to trello.com with the synced session cookie. Cookie-authenticated
+// writes additionally require Trello's CSRF token — the `dsc` cookie — sent
+// both as a cookie and as a request parameter.
+const TRELLO_ID_SHAPE = /^[a-f0-9]{24}$/i;
+const CARD_UPDATE_PARAMS = [
+  "closed",
+  "dueComplete",
+  "idList",
+  "idBoard",
+  "name",
+  "due",
+  "pos",
+] as const;
+
+app.on(["PUT", "POST"], "/1/cards/:id", async (c) => {
+  const cardId = c.req.param("id");
+  if (!TRELLO_ID_SHAPE.test(cardId)) {
+    return c.json({ error: "malformed card id" }, 400);
+  }
+
+  const params = new URLSearchParams();
+  for (const key of CARD_UPDATE_PARAMS) {
+    const value = c.req.query(key);
+    if (value === undefined) continue;
+    if (
+      (key === "closed" || key === "dueComplete") &&
+      value !== "true" &&
+      value !== "false"
+    ) {
+      return c.json({ error: `${key} must be true or false` }, 400);
+    }
+    if ((key === "idList" || key === "idBoard") && !TRELLO_ID_SHAPE.test(value)) {
+      return c.json({ error: `${key} must be a 24-char Trello id` }, 400);
+    }
+    params.set(key, value);
+  }
+  if ([...params.keys()].length === 0) {
+    return c.json({ error: "no card fields to update" }, 400);
+  }
+
+  // Attempt 1: official REST API with key+token — works for board cards.
+  const tokenResp = await fetch(
+    `https://api.trello.com/1/cards/${cardId}?${params}&key=${c.env.TRELLO_KEY}&token=${c.env.TRELLO_TOKEN}`,
+    { method: "PUT" },
+  );
+  if (tokenResp.ok) {
+    return c.json({ ok: true, via: "token" });
+  }
+  const tokenErr = `${tokenResp.status}: ${(await tokenResp.text().catch(() => "")).slice(0, 200)}`;
+  if (tokenResp.status !== 401 && tokenResp.status !== 403) {
+    // Not an auth problem (bad list id, deleted card, …) — the cookie
+    // session would hit the same wall, so pass Trello's answer through.
+    return c.json(
+      { error: "Trello card update failed", detail: tokenErr },
+      502,
+    );
+  }
+
+  // Attempt 2: cookie session — the only auth Trello accepts for Inbox cards.
+  const [sessionCookie, dsc] = await Promise.all([
+    c.env.SESSION_KV.get("trello:cookie"),
+    c.env.SESSION_KV.get("trello:dsc"),
+  ]);
+  if (!sessionCookie) {
+    return c.json(
+      {
+        error:
+          "key+token was refused and no session cookie is synced — run the Trello Inbox Sync extension",
+        detail: tokenErr,
+      },
+      428,
+    );
+  }
+  const cookieParams = new URLSearchParams(params);
+  if (dsc) cookieParams.set("dsc", dsc);
+  const cookieHeader = dsc
+    ? `cloud.session.token=${sessionCookie}; dsc=${dsc}`
+    : `cloud.session.token=${sessionCookie}`;
+  const cookieResp = await fetch(
+    `https://trello.com/1/cards/${cardId}?${cookieParams}`,
+    { method: "PUT", headers: { Cookie: cookieHeader } },
+  );
+  if (cookieResp.ok) {
+    return c.json({ ok: true, via: "cookie" });
+  }
+  const cookieErr = `${cookieResp.status}: ${(await cookieResp.text().catch(() => "")).slice(0, 200)}`;
+  return c.json(
+    {
+      error: "Trello card update failed via key+token and session cookie",
+      tokenAttempt: tokenErr,
+      cookieAttempt: cookieErr,
+      ...(dsc
+        ? {}
+        : {
+            hint: "no dsc CSRF token synced — update the Trello Inbox Sync extension and re-sync",
+          }),
+    },
+    502,
+  );
 });
 
 // Trello types
