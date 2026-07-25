@@ -10,6 +10,10 @@
 const WORKER_ORIGIN = "https://trello-tasker-widget.pmaxhogan.workers.dev";
 const SESSION_ENDPOINT = `${WORKER_ORIGIN}/trello-session`;
 const COOKIE_NAME = "cloud.session.token";
+// Trello's CSRF token. Reads work with the session cookie alone, but
+// cookie-authenticated writes (archiving/moving Inbox cards from the widget)
+// are rejected unless the request carries a matching dsc value.
+const DSC_COOKIE_NAME = "dsc";
 const ALARM_NAME = "trello-inbox-sync";
 // Trello session cookies live for ~30 days but the server may rotate them
 // earlier. Re-sync every 6 hours as a safety net in addition to onChanged.
@@ -22,10 +26,10 @@ async function getInboxSessionKey() {
     : null;
 }
 
-async function readCookie() {
+async function readCookie(name) {
   const cookie = await chrome.cookies.get({
     url: "https://trello.com/",
-    name: COOKIE_NAME,
+    name,
   });
   return cookie?.value ?? null;
 }
@@ -38,9 +42,10 @@ async function recordStatus(status) {
 }
 
 async function syncCookie(reason) {
-  const [sessionKey, token] = await Promise.all([
+  const [sessionKey, token, dsc] = await Promise.all([
     getInboxSessionKey(),
-    readCookie(),
+    readCookie(COOKIE_NAME),
+    readCookie(DSC_COOKIE_NAME),
   ]);
   if (!sessionKey) {
     await recordStatus("no INBOX_SESSION_KEY configured");
@@ -57,7 +62,7 @@ async function syncCookie(reason) {
         "Content-Type": "application/json",
         Authorization: `Bearer ${sessionKey}`,
       },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify(dsc ? { token, dsc } : { token }),
     });
     if (resp.ok) {
       await recordStatus(`ok (${reason})`);
@@ -85,7 +90,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 chrome.cookies.onChanged.addListener(({ cookie, removed }) => {
-  if (cookie.name !== COOKIE_NAME) return;
+  if (cookie.name !== COOKIE_NAME && cookie.name !== DSC_COOKIE_NAME) return;
   if (!cookie.domain.endsWith("trello.com")) return;
   if (removed) return;
   syncCookie("cookie changed");

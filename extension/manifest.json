@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Trello Inbox Sync",
-  "version": "1.0.0",
-  "description": "Syncs your Trello session cookie to your trello-tasker-widget Worker so it can render your Trello Inbox.",
+  "version": "1.1.0",
+  "description": "Syncs your Trello session cookies to your trello-tasker-widget Worker so it can render your Trello Inbox and act on its cards.",
   "permissions": ["cookies", "storage", "alarms"],
   "host_permissions": [
     "https://trello.com/*",
