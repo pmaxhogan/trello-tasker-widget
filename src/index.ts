@@ -1,4 +1,5 @@
 import { OpenAPIHono } from "@hono/zod-openapi";
+import type { Context } from "hono";
 
 type AppEnv = {
   Bindings: Env;
@@ -90,7 +91,11 @@ function timingSafeEqualStr(a: string, b: string): boolean {
 // (distinct secret) so a leak of the widget key does not compromise the
 // Chrome-extension endpoint and vice versa.
 app.use("*", async (c, next) => {
-  if (c.req.path === "/trello-session" || c.req.path === "/privacy") {
+  if (
+    c.req.path === "/trello-session" ||
+    c.req.path === "/privacy" ||
+    c.req.path === "/trello-webhook"
+  ) {
     await next();
     return;
   }
@@ -279,6 +284,191 @@ app.on(["PUT", "POST"], "/1/cards/:id", async (c) => {
     },
     502,
   );
+});
+
+// Push refresh: Trello webhook → FCM → Tasker.
+//
+// Tasker's "Remote Action Execution" registers the phone with Firebase Cloud
+// Messaging under our own Firebase project and runs the task named in a data
+// message's `task` key (extra `%var` keys become task variables). So a board
+// change reaches the widgets with no polling and no notification-intercept
+// relay: Trello POSTs /trello-webhook, we send one FCM data message, Tasker
+// runs FCM_TASK, which calls /refresh.
+//
+// - The phone reports its FCM registration token to POST /fcm-token (gated by
+//   API_KEY like /refresh) whenever Tasker says it changed; it lives in
+//   SESSION_KV["fcm:token"].
+// - FCM_SERVICE_ACCOUNT is the service account key JSON, whose custom role
+//   holds only cloudmessaging.messages.create.
+
+const FCM_TOKEN_SHAPE = /^[A-Za-z0-9_:\-]{32,4096}$/;
+const FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging";
+
+interface ServiceAccount {
+  client_email: string;
+  private_key: string;
+  project_id: string;
+}
+
+function base64Url(data: ArrayBuffer | string): string {
+  const bytes =
+    typeof data === "string"
+      ? new TextEncoder().encode(data)
+      : new Uint8Array(data);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+let cachedAccessToken: { token: string; exp: number } | null = null;
+
+async function getFcmAccessToken(
+  sa: ServiceAccount,
+  kv: KVNamespace,
+): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  if (cachedAccessToken && cachedAccessToken.exp - 60 > now) {
+    return cachedAccessToken.token;
+  }
+  const stored = await kv.get<{ token: string; exp: number }>(
+    "fcm:access_token",
+    "json",
+  );
+  if (stored && stored.exp - 60 > now) {
+    cachedAccessToken = stored;
+    return stored.token;
+  }
+
+  const pem = sa.private_key.replace(/-----[A-Z ]+-----|\s/g, "");
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    Uint8Array.from(atob(pem), (ch) => ch.charCodeAt(0)),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const unsigned = `${base64Url(JSON.stringify({ alg: "RS256", typ: "JWT" }))}.${base64Url(
+    JSON.stringify({
+      iss: sa.client_email,
+      scope: FCM_SCOPE,
+      aud: "https://oauth2.googleapis.com/token",
+      iat: now,
+      exp: now + 3600,
+    }),
+  )}`;
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    new TextEncoder().encode(unsigned),
+  );
+  const resp = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: `${unsigned}.${base64Url(signature)}`,
+    }),
+  });
+  if (!resp.ok) {
+    throw new Error(
+      `Google token exchange failed: ${resp.status} ${(await resp.text()).slice(0, 200)}`,
+    );
+  }
+  const data: { access_token: string; expires_in: number } = await resp.json();
+  cachedAccessToken = { token: data.access_token, exp: now + data.expires_in };
+  await kv.put("fcm:access_token", JSON.stringify(cachedAccessToken), {
+    expirationTtl: Math.max(60, data.expires_in),
+  });
+  return data.access_token;
+}
+
+async function sendRefreshPush(
+  env: Env,
+): Promise<{ ok: boolean; status: number; detail: string }> {
+  if (!env.FCM_SERVICE_ACCOUNT) {
+    return { ok: false, status: 500, detail: "Missing secret binding" };
+  }
+  const deviceToken = await env.SESSION_KV.get("fcm:token");
+  if (!deviceToken) {
+    return { ok: false, status: 428, detail: "no FCM device token stored" };
+  }
+  const sa: ServiceAccount = JSON.parse(env.FCM_SERVICE_ACCOUNT);
+  const accessToken = await getFcmAccessToken(sa, env.SESSION_KV);
+  const resp = await fetch(
+    `https://fcm.googleapis.com/v1/projects/${sa.project_id}/messages:send`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        message: {
+          token: deviceToken,
+          // collapse_key: a burst of board changes while the phone is offline
+          // delivers as a single refresh when it reconnects.
+          android: {
+            priority: "high",
+            collapse_key: "trello-refresh",
+            ttl: "3600s",
+          },
+          data: { task: env.FCM_TASK },
+        },
+      }),
+    },
+  );
+  const detail = resp.ok ? "sent" : (await resp.text()).slice(0, 300);
+  if (!resp.ok) {
+    // 404 UNREGISTERED means the stored device token is stale; the phone
+    // re-reports it via /fcm-token on the next token change.
+    console.error(`FCM send failed: ${resp.status} ${detail}`);
+  }
+  return { ok: resp.ok, status: resp.status, detail };
+}
+
+app.post("/fcm-token", async (c) => {
+  let body: { token?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+  const token = body.token;
+  if (typeof token !== "string" || !FCM_TOKEN_SHAPE.test(token)) {
+    return c.json({ error: "missing or malformed token" }, 400);
+  }
+  await c.env.SESSION_KV.put("fcm:token", token);
+  return c.json({ ok: true, length: token.length });
+});
+
+// Trello webhook callback. Gated by TRELLO_WEBHOOK_SECRET in the callback
+// URL's query string rather than Trello's HMAC header: the payload is never
+// trusted or even read — it only triggers a refresh, and /refresh re-reads
+// Trello itself. Trello validates the callback with a HEAD request when the
+// webhook is created (Hono answers HEAD from the GET route) and disables a
+// webhook that keeps failing, so POST answers 200 even when the push fails.
+function webhookAuthorized(c: Context<AppEnv>): boolean {
+  const expected = c.env.TRELLO_WEBHOOK_SECRET;
+  return (
+    !!expected && timingSafeEqualStr(c.req.query("secret") || "", expected)
+  );
+}
+
+app.get("/trello-webhook", (c) =>
+  webhookAuthorized(c) ? c.text("OK") : c.text("Unauthorized", 401),
+);
+
+app.post("/trello-webhook", async (c) => {
+  if (!webhookAuthorized(c)) return c.text("Unauthorized", 401);
+  try {
+    return c.json(await sendRefreshPush(c.env));
+  } catch (err) {
+    console.error("Refresh push failed", err);
+    return c.json({ ok: false, status: 500, detail: String(err) });
+  }
 });
 
 // Trello types

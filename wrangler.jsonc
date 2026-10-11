@@ -35,6 +35,8 @@
     },
   ],
   "vars": {
+    // Tasker task run by the FCM push sent from /trello-webhook
+    "FCM_TASK": "Setup widgets",
     "LIST_NAMES": ["Inbox", "Ready", "Today", "Progress", "Work"],
     "LIST_NAME_TO_BUTTONS": {
       "Inbox": "Archive,Ready,Today,Work,Done",
