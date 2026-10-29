@@ -187,7 +187,7 @@ app.post("/trello-session", async (c) => {
 // try the official REST API first (normal board cards), and on 401/403 fall
 // back to trello.com with the synced session cookie. Cookie-authenticated
 // writes additionally require Trello's CSRF token — the `dsc` cookie — sent
-// both as a cookie and as a request parameter.
+// both as a cookie and as a field in the request body.
 const TRELLO_ID_SHAPE = /^[a-f0-9]{24}$/i;
 const CARD_UPDATE_PARAMS = [
   "closed",
@@ -258,15 +258,23 @@ app.on(["PUT", "POST"], "/1/cards/:id", async (c) => {
       428,
     );
   }
+  // Trello's CSRF check only reads `dsc` from the request body: the same
+  // request with dsc in the query string is rejected with 403
+  // REQUEST_CSRF_ERROR. So send the fields form-encoded in the body, like
+  // the web client does.
   const cookieParams = new URLSearchParams(params);
   if (dsc) cookieParams.set("dsc", dsc);
   const cookieHeader = dsc
     ? `cloud.session.token=${sessionCookie}; dsc=${dsc}`
     : `cloud.session.token=${sessionCookie}`;
-  const cookieResp = await fetch(
-    `https://trello.com/1/cards/${cardId}?${cookieParams}`,
-    { method: "PUT", headers: { Cookie: cookieHeader } },
-  );
+  const cookieResp = await fetch(`https://trello.com/1/cards/${cardId}`, {
+    method: "PUT",
+    headers: {
+      Cookie: cookieHeader,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: cookieParams,
+  });
   if (cookieResp.ok) {
     return c.json({ ok: true, via: "cookie" });
   }
